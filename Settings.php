@@ -114,7 +114,7 @@ class AADSSO_Settings {
 	/**
 	 * @var string The OpenID Connect configuration discovery endpoint.
 	 */
-	public $openid_configuration_endpoint = 'https://login.microsoftonline.com/common/.well-known/openid-configuration';
+	public $openid_configuration_endpoint = 'https://login.microsoftonline.com/common/v2.0/.well-known/openid-configuration';
 
 	/**
 	 * @var string The OAuth 2.0 authorization endpoint.
@@ -147,6 +147,31 @@ class AADSSO_Settings {
 	public $graph_version = 'v1.0';
 
 	/**
+	 * Returns settings sourced from environment variables.
+	 *
+	 * Supported variables: AADSSO_CLIENT_ID, AADSSO_CLIENT_SECRET, AADSSO_REDIRECT_URI
+	 *
+	 * @return array Associative array of settings found in environment variables.
+	 */
+	public static function get_settings_from_env() {
+		$env_map = array(
+			'client_id'     => 'AADSSO_CLIENT_ID',
+			'client_secret' => 'AADSSO_CLIENT_SECRET',
+			'redirect_uri'  => 'AADSSO_REDIRECT_URI',
+		);
+
+		$env_settings = array();
+		foreach ( $env_map as $key => $env_var ) {
+			$value = getenv( $env_var );
+			if ( false !== $value && '' !== $value ) {
+				$env_settings[ $key ] = $value;
+			}
+		}
+
+		return $env_settings;
+	}
+
+	/**
 	 * Returns a sensible set of defaults for the plugin.
 	 *
 	 * If key is provided, only that default is returned.
@@ -167,7 +192,7 @@ class AADSSO_Settings {
 			'enable_aad_group_to_wp_role' => false,
 			'redirect_uri' => wp_login_url(),
 			'logout_redirect_uri' => wp_login_url(),
-			'openid_configuration_endpoint' => 'https://login.microsoftonline.com/common/.well-known/openid-configuration',
+			'openid_configuration_endpoint' => 'https://login.microsoftonline.com/common/v2.0/.well-known/openid-configuration',
 		);
 
 		if ( null === $key ) {
@@ -203,7 +228,15 @@ class AADSSO_Settings {
 		$instance = self::get_instance();
 
 		// First, retrieve the settings stored in the WordPress database.
-		$instance->load_settings( get_option( 'aadsso_settings' ) );
+		$stored = is_multisite() ? get_site_option( 'aadsso_settings' ) : get_option( 'aadsso_settings' );
+		$instance->load_settings( $stored );
+
+		// Then, apply environment variables as fallback for any settings that are still empty.
+		foreach ( self::get_settings_from_env() as $key => $value ) {
+			if ( empty( $instance->{$key} ) ) {
+				$instance->{$key} = $value;
+			}
+		}
 
 		/*
 		 * Then, add the settings stored in the OpenID Connect configuration endpoint.

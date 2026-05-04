@@ -22,10 +22,11 @@ class AADSSO_AuthorizationHelper
 		$auth_url = $settings->authorization_endpoint . '?'
 		 . http_build_query( array(
 					'response_type' => 'code',
-					'scope'         => 'openid',
+					// v2 endpoint uses scopes (resource is not used).
+					// Request the minimal Graph delegated permission plus OIDC basics.
+					'scope'         => 'openid profile email User.Read',
 					'domain_hint'   => $settings->org_domain_hint,
 					'client_id'     => $settings->client_id,
-					'resource'      => $settings->graph_endpoint,
 					'redirect_uri'  => $settings->redirect_uri,
 					'state'         => $antiforgery_id,
 					'nonce'         => $antiforgery_id,
@@ -50,7 +51,8 @@ class AADSSO_AuthorizationHelper
 				'grant_type'    => 'authorization_code',
 				'code'          => $code,
 				'redirect_uri'  => $settings->redirect_uri,
-				'resource'      => $settings->graph_endpoint,
+				// v2 endpoint uses scopes (resource is not used).
+				'scope'         => 'openid profile email User.Read',
 				'client_id'     => $settings->client_id,
 				'client_secret' => $settings->client_secret
 			)

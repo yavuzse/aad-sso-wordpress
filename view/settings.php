@@ -3,9 +3,18 @@
 	<h2><?php echo esc_html__( 'Single Sign-on with Microsoft Entra ID' , 'aad-sso-wordpress' ); ?></h2>
 	<p><?php echo esc_html__( 'Settings for configuring single sign-on with Microsoft Entra ID can be configured here.' , 'aad-sso-wordpress' ); ?></p>
 
-	<form method="post" action="options.php">
+	<?php
+		$form_action = is_multisite()
+			? admin_url( 'admin-post.php?action=aadsso_save_settings' )
+			: admin_url( 'options.php' );
+	?>
+	<form method="post" action="<?php echo esc_url( $form_action ); ?>">
 		<?php
-		settings_fields( 'aadsso_settings' );
+		if ( is_multisite() ) {
+			wp_nonce_field( 'aadsso_network_settings_save', 'aadsso_network_settings_nonce' );
+		} else {
+			settings_fields( 'aadsso_settings' );
+		}
 		do_settings_sections( 'aadsso_settings_page' );
 		submit_button();
 		?>
@@ -15,10 +24,14 @@
 	<p><?php echo esc_html__( 'Resetting the plugin will completely remove all settings.' , 'aad-sso-wordpress' ); ?></p>
 	<p>
 		<?php
+		$reset_base_url = is_multisite()
+			? network_admin_url( 'settings.php?page=aadsso_settings' )
+			: admin_url( 'options-general.php?page=aadsso_settings' );
+
 		printf(
 			'<a href="%s" class="button">%s</a> <span class="description">%s</span>',
 			wp_nonce_url(
-				admin_url( 'options-general.php?page=aadsso_settings' ),
+				$reset_base_url,
 				'aadsso_reset_settings',
 				'aadsso_nonce'
 			),
@@ -53,10 +66,14 @@
 		<?php endif; ?>
 		
 		<p><?php
+		$migrate_base_url = is_multisite()
+			? network_admin_url( 'settings.php?page=aadsso_settings' )
+			: admin_url( 'options-general.php?page=aadsso_settings' );
+
 		printf(
 			'<a href="%s" class="button">%s</a> <span class="description">%s</span>',
 			wp_nonce_url(
-				admin_url( 'options-general.php?page=aadsso_settings' ),
+				$migrate_base_url,
 				'aadsso_migrate_from_json',
 				'aadsso_nonce'
 			),

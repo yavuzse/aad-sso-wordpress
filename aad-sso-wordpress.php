@@ -99,9 +99,15 @@ class AADSSO {
 	 * Run on activation, checks for stored settings, and if none are found, sets defaults.
 	 */
 	public static function activate() {
-		$stored_settings = get_option( 'aadsso_settings', null );
+		$stored_settings = is_multisite()
+			? get_site_option( 'aadsso_settings', null )
+			: get_option( 'aadsso_settings', null );
 		if ( null === $stored_settings ) {
-			update_option( 'aadsso_settings', AADSSO_Settings::get_defaults() );
+			if ( is_multisite() ) {
+				update_site_option( 'aadsso_settings', AADSSO_Settings::get_defaults() );
+			} else {
+				update_option( 'aadsso_settings', AADSSO_Settings::get_defaults() );
+			}
 		}
 	}
 
@@ -288,8 +294,7 @@ class AADSSO {
 						$antiforgery_id
 					);
 
-					AADSSO::debug_log( 'ID Token: iss: \'' . $jwt->iss . '\', oid: \'' . $jwt->oid, 10 );
-					AADSSO::debug_log( json_encode( $jwt ), 50 );
+					AADSSO::debug_log( 'ID Token: iss: \'' . $jwt->iss . '\', oid: \'' . ( isset( $jwt->oid ) ? $jwt->oid : '' ) . '\'', 10 );
 
 				} catch ( Exception $e ) {
 					return new WP_Error(
@@ -302,42 +307,16 @@ class AADSSO {
 				$group_memberships = false;
 				if ( true === $this->settings->enable_aad_group_to_wp_role ) {
 
-					// TODO: Check if scopes from token response include necessary permissions for checking
-					//       group membership and if not, re-do the sign in with prompt=consent.
-
-					// If we're mapping Microsoft Entra ID groups to WordPress roles, make the Graph API call here
-					AADSSO_GraphHelper::$settings  = $this->settings;
-
-					// Of the AAD groups defined in the settings, get only those where the user is a member
-					$group_ids         = array_keys( $this->settings->aad_group_to_wp_role_map );
-					$group_memberships = AADSSO_GraphHelper::user_check_member_groups( $jwt->oid, $group_ids );
-					
-					// Validate response to throw an early error if unable to check group membership.
-					if ( isset( $group_memberships->value ) ) {
-						AADSSO::debug_log( sprintf(
-							'Microsoft Entra ID user \'%s\' is a member of [%s]',
-							$jwt->oid, implode( ',', $group_memberships->value ) ), 20
-						);
-					} elseif ( isset ( $group_memberships->error ) ) {
-						AADSSO::debug_log( 'Error when checking group membership: ' . json_encode( $group_memberships ) );
-						return new WP_Error(
-							'error_checking_group_membership',
-							sprintf(
-								__( 'ERROR: Unable to check group membership with Microsoft Graph: '
-									. '<b>%s</b> %s<br />%s', 'aad-sso-wordpress' ),
-								$group_memberships->error->code, 
-								$group_memberships->error->message,
-								json_encode( $group_memberships->error->innerError )
-							)
-						);
-					} else {
-						AADSSO::debug_log( 'Unexpected response to checkMemberGroups: ' . json_encode( $group_memberships ) );
-						return new WP_Error(
-							'unexpected_response_to_checkMemberGroups',
-							__( 'ERROR: Unexpected response when checking group membership with Microsoft Graph.', 
-								'aad-sso-wordpress' )
-						);
-					}
+					/*
+					 * Avoid Microsoft Graph directory permissions by using group information emitted
+					 * directly in the ID token:
+					 *  - 'groups' claim (group object IDs)
+					 *  - or 'roles' claim (app roles) as a fallback
+					 *
+					 * This requires configuration in the Entra ID app registration (Token configuration /
+					 * optional claims / group claims). See README.
+					 */
+					$group_memberships = $this->get_group_memberships_from_jwt( $jwt );
 				}
 
 				// Invoke any configured matching and auto-provisioning strategy and get the user. We include
@@ -391,13 +370,22 @@ class AADSSO {
 
 	function get_wp_user_from_aad_user( $jwt, $group_memberships ) {
 
-		// Try to find an existing user in WP where the upn or unique_name of the current Microsoft Entra ID user is
-		// (depending on config) the 'login' or 'email' field in WordPress
-		$unique_name = isset( $jwt->upn ) ? $jwt->upn : ( isset( $jwt->unique_name ) ? $jwt->unique_name : null );
+		// v2 ID tokens commonly use preferred_username instead of upn/unique_name.
+		$unique_name = null;
+		if ( isset( $jwt->preferred_username ) && ! empty( $jwt->preferred_username ) ) {
+			$unique_name = $jwt->preferred_username;
+		} elseif ( isset( $jwt->upn ) && ! empty( $jwt->upn ) ) {
+			$unique_name = $jwt->upn;
+		} elseif ( isset( $jwt->unique_name ) && ! empty( $jwt->unique_name ) ) {
+			$unique_name = $jwt->unique_name;
+		} elseif ( isset( $jwt->email ) && ! empty( $jwt->email ) ) {
+			$unique_name = $jwt->email;
+		}
+
 		if ( null === $unique_name ) {
 			return new WP_Error(
 				'unique_name_not_found',
-				__( 'ERROR: Neither \'upn\' nor \'unique_name\' claims not found in ID Token.',
+				__( 'ERROR: No usable username claim found in ID Token (tried preferred_username, upn, unique_name, email).',
 					'aad-sso-wordpress' )
 			);
 		}
@@ -483,6 +471,41 @@ class AADSSO {
 	}
 
 	/**
+	 * Normalizes group membership information to the same shape we previously got from
+	 * Graph /checkMemberGroups: an object with a ->value array of IDs.
+	 *
+	 * @param object $jwt Decoded ID token.
+	 *
+	 * @return object Object with a ->value array (may be empty).
+	 */
+	private function get_group_memberships_from_jwt( $jwt ) {
+		$ids = array();
+
+		if ( isset( $jwt->groups ) && is_array( $jwt->groups ) ) {
+			$ids = $jwt->groups;
+			AADSSO::debug_log( 'Using groups claim. Group IDs: [' . implode( ', ', $ids ) . ']' );
+		} elseif ( isset( $jwt->roles ) && is_array( $jwt->roles ) ) {
+			// App roles can be used as an alternative to groups when group claims aren't possible.
+			$ids = $jwt->roles;
+			AADSSO::debug_log( 'Using roles claim (fallback). Role values: [' . implode( ', ', $ids ) . ']' );
+		} else {
+			AADSSO::debug_log( 'No groups or roles claim found in JWT.' );
+		}
+
+		// If token contains too many groups, Entra ID may emit an overage indicator instead.
+		// We intentionally do not fall back to Graph here, to keep Directory.Read.* out.
+		if ( isset( $jwt->_claim_names ) && isset( $jwt->_claim_names->groups ) ) {
+			AADSSO::debug_log(
+				'ID token indicates group overage (_claim_names.groups). Group-based role mapping cannot be evaluated without directory permissions.',
+				10
+			);
+			$ids = array();
+		}
+
+		return (object) array( 'value' => $ids );
+	}
+
+	/**
 		* Sets a WordPress user's role based on their AAD group memberships
 		*
 		* @param WP_User $user
@@ -494,6 +517,8 @@ class AADSSO {
 
 		// Determine which WordPress role the AAD group corresponds to.
 		$roles_to_set = array();
+		AADSSO::debug_log( sprintf(
+			'Checking group memberships [%s] for user [%s] against role mapping...', implode( ', ', $group_memberships->value ), $user->ID ), 10 );
 
 		if ( ! empty( $group_memberships->value ) ) {
 			foreach ( $this->settings->aad_group_to_wp_role_map as $aad_group => $wp_role ) {
@@ -502,28 +527,84 @@ class AADSSO {
 				}
 			}
 		}
+        // Backwards compatibility: allow login if user is already known, even if no group in JWT
+        if ( empty( $group_memberships->value ) && ! empty( $user->roles ) ) {
+            AADSSO::debug_log( sprintf(
+                'Backwards compatibility: User [%s] has existing roles [%s] and no group in JWT. Allow login and notify.', $user->ID, implode(', ', $user->roles)), 10 );
+            // Optionally: here you could trigger an email or other notification
+            return $user;
+        }
 
 		if ( ! empty( $roles_to_set ) ) {
-			$user->set_role( '' );
-			foreach ( $roles_to_set as $role ) {
-				$user->add_role( $role );
+
+			if ( is_multisite() ) {
+				// In multisite, assign roles on ALL sites in the network
+				$this->update_wp_user_roles_on_all_sites( $user, $roles_to_set );
+			} else {
+				$user->set_role( '' );
+				foreach ( $roles_to_set as $role ) {
+					$user->add_role( $role );
+				}
 			}
+
 			AADSSO::debug_log( sprintf(
 				'Set roles [%s] for user [%s].', implode( ', ', $roles_to_set ), $user->ID ), 10 );
 		} else if ( ! empty( $this->settings->default_wp_role ) ) {
-			$user->set_role( $this->settings->default_wp_role );
+
+			if ( is_multisite() ) {
+				$this->update_wp_user_roles_on_all_sites( $user, array( $this->settings->default_wp_role ) );
+			} else {
+				$user->set_role( $this->settings->default_wp_role );
+			}
+
 			AADSSO::debug_log( sprintf( 
 				'Set default role [%s] for user [%s].', $this->settings->default_wp_role, $user->ID ), 10 );
 		} else {
 			$error_message = sprintf(
-				__( 'ERROR: Microsoft Entra ID user %s is not a member of any group granting a role.', 'aad-sso-wordpress' ),
-				$aad_user_id
+				__( 'ERROR: Microsoft Entra ID user is not a member of any group granting a role.', 'aad-sso-wordpress' )
 			);
+
 			AADSSO::debug_log( $error_message, 10 );
 			return new WP_Error( 'user_not_member_of_required_group', $error_message );
 		}
 
 		return $user;
+	}
+
+	/**
+	 * Assigns the given roles to a user on every site in the multisite network.
+	 *
+	 * Iterates over all sites, adds the user as a member if not already, clears
+	 * existing roles and sets the provided ones.
+	 *
+	 * @param WP_User $user        The WordPress user.
+	 * @param array   $roles       Array of WordPress role slugs to assign.
+	 */
+	private function update_wp_user_roles_on_all_sites( $user, $roles ) {
+		$sites = get_sites( array( 'number' => 0 ) );
+
+		foreach ( $sites as $site ) {
+			switch_to_blog( $site->blog_id );
+
+			// Ensure the user is a member of this site
+			if ( ! is_user_member_of_blog( $user->ID, $site->blog_id ) ) {
+				add_user_to_blog( $site->blog_id, $user->ID, $roles[0] );
+				AADSSO::debug_log( sprintf(
+					'Added user [%s] to site [%s] with role [%s].', $user->ID, $site->blog_id, $roles[0] ), 10 );
+			}
+
+			// Refresh the user object for this site and set roles
+			$site_user = new WP_User( $user->ID, '', $site->blog_id );
+			$site_user->set_role( '' );
+			foreach ( $roles as $role ) {
+				$site_user->add_role( $role );
+			}
+
+			AADSSO::debug_log( sprintf(
+				'Set roles [%s] for user [%s] on site [%s].', implode( ', ', $roles ), $user->ID, $site->blog_id ), 10 );
+
+			restore_current_blog();
+		}
 	}
 
 	/**
@@ -534,8 +615,10 @@ class AADSSO {
 	 * @return array The new list of links to display
 	 */
 	function add_settings_link( $links ) {
-		$link_to_settings =
-			'<a href="' . admin_url( 'options-general.php?page=aadsso_settings' ) . '">Settings</a>';
+		$link_url = is_multisite()
+			? network_admin_url( 'settings.php?page=aadsso_settings' )
+			: admin_url( 'options-general.php?page=aadsso_settings' );
+		$link_to_settings = '<a href="' . $link_url . '">Settings</a>';
 		array_push( $links, $link_to_settings );
 		return $links;
 	}
@@ -743,4 +826,4 @@ if ( ! function_exists( 'com_create_guid' ) ) {
 
 // Load settings JSON contents from DB and initialize the plugin
 $aadsso_settings_instance = AADSSO_Settings::init();
-$aadsso = AADSSO::get_instance( $aadsso_settings_instance, com_create_guid() );
+$aadsso = AADSSO::get_instance( $aadsso_settings_instance );

@@ -61,13 +61,11 @@ With these steps, you will create a Microsoft Entra ID app registration. This wi
 
     ![API permissions](https://user-images.githubusercontent.com/231140/66045425-03fce700-e524-11e9-82ae-8772fa4e9724.png)
 
-5. Verify that the delegated permission *User.Read* for Microsoft Graph is already be selected. This permission is all you need if you do not require mapping Microsoft Entra ID group membership to WordPress roles.
+5. Verify that the delegated permission *User.Read* for Microsoft Graph is already be selected.
 
     ![User.Read delegated permission for Microsoft Graph](https://user-images.githubusercontent.com/231140/66046005-23484400-e525-11e9-9712-fed4c5273040.png)
 
-   > **Note**: If you do wish to map Microsoft Entra ID groups to WordPress roles, you must also select the delegated permission *Directory.Read.All* (click "Add a permission" > Microsoft Graph > Delegated > *Directory.Read.All*).
-    
-   > **Important**: Some permissions *require* administrator consent before it can be used, and in some organizations, administrator consent is required for *any* permission. A tenant administrator can use the **Grant admin consent** option to grant the permissions (i.e. consent) on behalf of all users in the organization.
+   > **Note**: Group-to-role mapping in this plugin no longer requires *Directory.Read.All*. Instead, configure your app registration to emit group information (or app roles) directly in the **ID token**. See the section **Set WordPress roles based on Microsoft Entra ID group membership** below.
 
 6. Under **Certificates & secrets**, create a new client secret. Provide a description and choose a duration (I recommend no longer than two years). After clicking **Add**, the secret value will appear. Copy it, as this is the only time it will be available.
 
@@ -126,7 +124,7 @@ This is also configured **Settings** > **Microsoft Entra ID** (from the WordPres
   </dd>
 </dl>
 
-> **Note**: For the Microsoft Entra ID group to WordPress role mapping to work, the app in Microsoft Entra ID needs the delegated permission *Directory.Read.All* for Microsoft Graph. See step 5 of *Register a Microsoft Entra ID application*, above, for more details.
+> **Note**: For the Microsoft Entra ID group to WordPress role mapping to work, your app registration must be configured to include either the **`groups` claim** (recommended) or **`roles` claim** in the ID token. This avoids the need for Microsoft Graph directory permissions.
 
 ## Example settings
 

@@ -14,6 +14,11 @@ class AADSSO_Settings_Page {
 	private $settings;
 
 	/**
+	 * Setting keys whose value currently comes from an environment variable.
+	 */
+	private $settings_from_env = array();
+
+	/**
 	 * The option page's hook_suffix returned from add_options_page
 	 */
 	private $options_page_id;
@@ -23,17 +28,33 @@ class AADSSO_Settings_Page {
 		// Ensure jQuery is loaded.
 		add_action( 'admin_enqueue_scripts', array( $this, 'maybe_include_jquery' ) );
 
-		// Add the 'Microsoft Entra ID' options page.
-		add_action( 'admin_menu', array( $this, 'add_options_page' ) );
+		// Add the settings page.
+		if ( is_multisite() ) {
+			add_action( 'network_admin_menu', array( $this, 'add_options_page' ) );
+		} else {
+			add_action( 'admin_menu', array( $this, 'add_options_page' ) );
+		}
 
 		// Register the settings.
 		add_action( 'admin_init', array( $this, 'register_settings' ) );
+
+		// In Multisite, handle saving via a custom Network Admin handler.
+		if ( is_multisite() ) {
+			add_action( 'admin_post_aadsso_save_settings', array( $this, 'handle_network_settings_save' ) );
+		}
 
 		// Reset settings if requested to.
 		add_action( 'admin_init', array( $this, 'maybe_reset_settings' ) );
 
 		// Migrate settings if requested to.
 		add_action( 'admin_init', array( $this, 'maybe_migrate_settings' ) );
+
+		if ( is_multisite() ) {
+			// Ensure these also run in Network Admin.
+			add_action( 'network_admin_edit_aadsso_settings', array( $this, 'register_settings' ) );
+			add_action( 'network_admin_edit_aadsso_settings', array( $this, 'maybe_reset_settings' ) );
+			add_action( 'network_admin_edit_aadsso_settings', array( $this, 'maybe_migrate_settings' ) );
+		}
 
 		// If settings were reset, show confirmation.
 		add_action( 'all_admin_notices', array( $this, 'notify_if_reset_successful' ) );
@@ -45,9 +66,38 @@ class AADSSO_Settings_Page {
 		$_SERVER['REQUEST_URI'] = remove_query_arg( 'aadsso_reset', $_SERVER['REQUEST_URI'] );
 		$_SERVER['REQUEST_URI'] = remove_query_arg( 'aadsso_migrate_from_json_status', $_SERVER['REQUEST_URI'] );
 
-		// Load stored configuration values, with defaults if there's nothing set.
+		// Load raw DB value directly via $wpdb to bypass any stale Redis/object-cache
+		// that was causing get_site_option() to return false even when data existed.
+		if ( is_multisite() ) {
+			global $wpdb;
+			$network_id      = get_current_network_id();
+			$raw_meta_value  = $wpdb->get_var( $wpdb->prepare(
+				"SELECT meta_value FROM {$wpdb->sitemeta} WHERE site_id = %d AND meta_key = 'aadsso_settings' ORDER BY meta_id DESC LIMIT 1",
+				$network_id
+			) );
+			$stored_settings = $raw_meta_value ? maybe_unserialize( $raw_meta_value ) : false;
+		} else {
+			$stored_settings = get_option( 'aadsso_settings' );
+		}
+		$stored_settings = is_array( $stored_settings ) ? $stored_settings : array();
+
+		// Start from the raw DB values.
+		$this->settings = $stored_settings;
+
+		// Apply environment variables for any key not explicitly saved in the DB
+		// (or saved as an empty string). Env vars take precedence over WP defaults.
+		foreach ( AADSSO_Settings::get_settings_from_env() as $key => $value ) {
+			$in_db    = array_key_exists( $key, $stored_settings );
+			$db_empty = $in_db && $stored_settings[ $key ] === '';
+
+			if ( ! $in_db || $db_empty ) {
+				$this->settings[ $key ] = $value;
+				$this->settings_from_env[] = $key;
+			}
+		}
+
+		// Apply WordPress defaults for anything still missing.
 		$default_settings = AADSSO_Settings::get_defaults();
-		$this->settings = get_option( 'aadsso_settings', $default_settings );
 		foreach ( $default_settings as $key => $default_value ) {
 			if ( ! isset( $this->settings[ $key ] ) ) {
 				$this->settings[ $key ] = $default_value;
@@ -63,8 +113,13 @@ class AADSSO_Settings_Page {
 		$should_reset_settings = isset( $_GET['aadsso_nonce'] )
 		                          && wp_verify_nonce( $_GET['aadsso_nonce'], 'aadsso_reset_settings' );
 		if ( $should_reset_settings ) {
-			delete_option( 'aadsso_settings' );
-			wp_redirect( admin_url( 'options-general.php?page=aadsso_settings&aadsso_reset=success' ) );
+			if ( is_multisite() ) {
+				delete_site_option( 'aadsso_settings' );
+				wp_redirect( network_admin_url( 'settings.php?page=aadsso_settings&aadsso_reset=success' ) );
+			} else {
+				delete_option( 'aadsso_settings' );
+				wp_redirect( admin_url( 'options-general.php?page=aadsso_settings&aadsso_reset=success' ) );
+			}
 		}
 	}
 
@@ -89,7 +144,11 @@ class AADSSO_Settings_Page {
 			$legacy_settings = json_decode( file_get_contents( AADSSO_SETTINGS_PATH ), true );
 
 			if ( null === $legacy_settings ) {
-				wp_redirect( admin_url( 'options-general.php?page=aadsso_settings&aadsso_migrate_from_json_status=invalid_json') );
+				if ( is_multisite() ) {
+					wp_redirect( network_admin_url( 'settings.php?page=aadsso_settings&aadsso_migrate_from_json_status=invalid_json') );
+				} else {
+					wp_redirect( admin_url( 'options-general.php?page=aadsso_settings&aadsso_migrate_from_json_status=invalid_json') );
+				}
 			}
 
 			// If aad_group_to_wp_role_map is set in the legacy settings, build the inverted role_map array,
@@ -107,12 +166,24 @@ class AADSSO_Settings_Page {
 
 			$sanitized_settings = $this->sanitize_settings( $legacy_settings );
 
-			update_option( 'aadsso_settings', $sanitized_settings );
+			if ( is_multisite() ) {
+				update_site_option( 'aadsso_settings', $sanitized_settings );
+			} else {
+				update_option( 'aadsso_settings', $sanitized_settings );
+			}
 
 			if ( is_writable( AADSSO_SETTINGS_PATH ) && is_writable( dirname( AADSSO_SETTINGS_PATH ) ) && unlink( AADSSO_SETTINGS_PATH ) ) {
-				wp_redirect( admin_url( 'options-general.php?page=aadsso_settings&aadsso_migrate_from_json_status=success' ) );
+				if ( is_multisite() ) {
+					wp_redirect( network_admin_url( 'settings.php?page=aadsso_settings&aadsso_migrate_from_json_status=success' ) );
+				} else {
+					wp_redirect( admin_url( 'options-general.php?page=aadsso_settings&aadsso_migrate_from_json_status=success' ) );
+				}
 			} else {
-				wp_redirect( admin_url( 'options-general.php?page=aadsso_settings&aadsso_migrate_from_json_status=manual' ) );
+				if ( is_multisite() ) {
+					wp_redirect( network_admin_url( 'settings.php?page=aadsso_settings&aadsso_migrate_from_json_status=manual' ) );
+				} else {
+					wp_redirect( admin_url( 'options-general.php?page=aadsso_settings&aadsso_migrate_from_json_status=manual' ) );
+				}
 			}
 		}
 	}
@@ -160,13 +231,24 @@ class AADSSO_Settings_Page {
 	 * Adds the 'Microsoft Entra ID' options page.
 	 */
 	public function add_options_page() {
-		$this->options_page_id = add_options_page(
-			__( 'Microsoft Entra ID Settings', 'aad-sso-wordpress' ), // page_title
-			'Microsoft Entra ID', // menu_title
-			'manage_options', // capability
-			'aadsso_settings', // menu_slug
-			array( $this, 'render_admin_page' ) // function
-		);
+		if ( is_multisite() ) {
+			$this->options_page_id = add_submenu_page(
+				'settings.php',
+				__( 'Microsoft Entra ID Settings', 'aad-sso-wordpress' ),
+				'Microsoft Entra ID',
+				'manage_network_options',
+				'aadsso_settings',
+				array( $this, 'render_admin_page' )
+			);
+		} else {
+			$this->options_page_id = add_options_page(
+				__( 'Microsoft Entra ID Settings', 'aad-sso-wordpress' ),
+				'Microsoft Entra ID',
+				'manage_options',
+				'aadsso_settings',
+				array( $this, 'render_admin_page' )
+			);
+		}
 	}
 
 	/**
@@ -181,6 +263,147 @@ class AADSSO_Settings_Page {
 	 */
 	public function register_settings() {
 
+		// In Multisite/Network Admin we don't use the regular Settings API persistence (options.php),
+		// because we store a single network-wide configuration using site options.
+		if ( is_multisite() ) {
+			add_settings_section(
+				'aadsso_settings_general',
+				__( 'General', 'aad-sso-wordpress' ),
+				array( $this, 'settings_general_info' ),
+				'aadsso_settings_page'
+			);
+
+			add_settings_section(
+				'aadsso_settings_advanced',
+				__( 'Advanced', 'aad-sso-wordpress' ),
+				array( $this, 'settings_advanced_info' ),
+				'aadsso_settings_page'
+			);
+
+			add_settings_field(
+				'org_display_name',
+				__( 'Display name', 'aad-sso-wordpress' ),
+				array( $this, 'org_display_name_callback' ),
+				'aadsso_settings_page',
+				'aadsso_settings_general'
+			);
+
+			add_settings_field(
+				'org_domain_hint', // id
+				__( 'Domain hint', 'aad-sso-wordpress' ), // title
+				array( $this, 'org_domain_hint_callback' ), // callback
+				'aadsso_settings_page', // page
+				'aadsso_settings_general' // section
+			);
+
+			add_settings_field(
+				'client_id', // id
+				__( 'Client ID', 'aad-sso-wordpress' ), // title
+				array( $this, 'client_id_callback' ), // callback
+				'aadsso_settings_page', // page
+				'aadsso_settings_general' // section
+			);
+
+			add_settings_field(
+				'client_secret', // id
+				__( 'Client secret', 'aad-sso-wordpress' ), // title
+				array( $this, 'client_secret_callback' ), // callback
+				'aadsso_settings_page', // page
+				'aadsso_settings_general' // section
+			);
+
+			add_settings_field(
+				'redirect_uri', // id
+				__( 'Redirect URL', 'aad-sso-wordpress' ), // title
+				array( $this, 'redirect_uri_callback' ), // callback
+				'aadsso_settings_page', // page
+				'aadsso_settings_general' // section
+			);
+
+			add_settings_field(
+				'logout_redirect_uri', // id
+				__( 'Logout redirect URL', 'aad-sso-wordpress' ), // title
+				array( $this, 'logout_redirect_uri_callback' ), // callback
+				'aadsso_settings_page', // page
+				'aadsso_settings_general' // section
+			);
+
+			add_settings_field(
+				'enable_full_logout', // id
+				__( 'Enable full logout', 'aad-sso-wordpress' ), // title
+				array( $this, 'enable_full_logout_callback' ), // callback
+				'aadsso_settings_page', // page
+				'aadsso_settings_general' // section
+			);
+
+			add_settings_field(
+				'field_to_match_to_upn', // id
+				__( 'Field to match to UPN', 'aad-sso-wordpress' ), // title
+				array( $this, 'field_to_match_to_upn_callback' ), // callback
+				'aadsso_settings_page', // page
+				'aadsso_settings_general' // section
+			);
+
+			add_settings_field(
+				'match_on_upn_alias', // id
+				__( 'Match on alias of the UPN', 'aad-sso-wordpress' ), // title
+				array( $this, 'match_on_upn_alias_callback' ), // callback
+				'aadsso_settings_page', // page
+				'aadsso_settings_general' // section
+			);
+
+			add_settings_field(
+				'enable_auto_provisioning', // id
+				__( 'Enable auto-provisioning', 'aad-sso-wordpress' ), // title
+				array( $this, 'enable_auto_provisioning_callback' ), // callback
+				'aadsso_settings_page', // page
+				'aadsso_settings_general' // section
+			);
+
+			add_settings_field(
+				'enable_auto_forward_to_aad', // id
+				__( 'Enable auto-forward to Microsoft Entra ID', 'aad-sso-wordpress' ), // title
+				array( $this, 'enable_auto_forward_to_aad_callback' ), // callback
+				'aadsso_settings_page', // page
+				'aadsso_settings_general' // section
+			);
+
+			add_settings_field(
+				'enable_aad_group_to_wp_role', // id
+				__( 'Enable Microsoft Entra ID group to WordPress role association', 'aad-sso-wordpress' ), // title
+				array( $this, 'enable_aad_group_to_wp_role_callback' ), // callback
+				'aadsso_settings_page', // page
+				'aadsso_settings_general' // section
+			);
+
+			add_settings_field(
+				'default_wp_role', // id
+				__( 'Default WordPress role if not in Microsoft Entra ID group', 'aad-sso-wordpress' ), // title
+				array( $this, 'default_wp_role_callback' ), // callback
+				'aadsso_settings_page', // page
+				'aadsso_settings_general' // section
+			);
+
+			add_settings_field(
+				'role_map', // id
+				__( 'WordPress role to Microsoft Entra ID group map', 'aad-sso-wordpress' ), // title
+				array( $this, 'role_map_callback' ), // callback
+				'aadsso_settings_page', // page
+				'aadsso_settings_general' // section
+			);
+
+			add_settings_field(
+				'openid_configuration_endpoint', // id
+				__( 'OpenID Connect configuration endpoint', 'aad-sso-wordpress' ), // title
+				array( $this, 'openid_configuration_endpoint_callback' ), // callback
+				'aadsso_settings_page', // page
+				'aadsso_settings_advanced' // section
+			);
+
+			return;
+		}
+
+		// Single-site settings: use the core Settings API.
 		register_setting(
 			'aadsso_settings', // option_group
 			'aadsso_settings', // option_name
@@ -188,25 +411,25 @@ class AADSSO_Settings_Page {
 		);
 
 		add_settings_section(
-			'aadsso_settings_general', // id
-			__( 'General', 'aad-sso-wordpress' ), // title
-			array( $this, 'settings_general_info' ), // callback
-			'aadsso_settings_page' // page
+			'aadsso_settings_general',
+			__( 'General', 'aad-sso-wordpress' ),
+			array( $this, 'settings_general_info' ),
+			'aadsso_settings_page'
 		);
 
 		add_settings_section(
-			'aadsso_settings_advanced', // id
-			__( 'Advanced', 'aad-sso-wordpress' ), // title
-			array( $this, 'settings_advanced_info' ), // callback
-			'aadsso_settings_page' // page
+			'aadsso_settings_advanced',
+			__( 'Advanced', 'aad-sso-wordpress' ),
+			array( $this, 'settings_advanced_info' ),
+			'aadsso_settings_page'
 		);
 
 		add_settings_field(
-			'org_display_name', // id
-			__( 'Display name', 'aad-sso-wordpress' ), // title
-			array( $this, 'org_display_name_callback' ), // callback
-			'aadsso_settings_page', // page
-			'aadsso_settings_general' // section
+			'org_display_name',
+			__( 'Display name', 'aad-sso-wordpress' ),
+			array( $this, 'org_display_name_callback' ),
+			'aadsso_settings_page',
+			'aadsso_settings_general'
 		);
 
 		add_settings_field(
@@ -248,7 +471,7 @@ class AADSSO_Settings_Page {
 			'aadsso_settings_page', // page
 			'aadsso_settings_general' // section
 		);
-		
+
 		add_settings_field(
 			'enable_full_logout', // id
 			__( 'Enable full logout', 'aad-sso-wordpress' ), // title
@@ -409,7 +632,9 @@ class AADSSO_Settings_Page {
 		// If the OpenID Connect configuration endpoint is changed, clear the cached values.
 		$stored_oidc_config_endpoint = isset( $this->settings['openid_configuration_endpoint'] )
 			? $this->settings['openid_configuration_endpoint'] : null;
-		if ( $stored_oidc_config_endpoint !== $sanitary_values['openid_configuration_endpoint'] ) {
+		$new_oidc_config_endpoint = isset( $sanitary_values['openid_configuration_endpoint'] )
+			? $sanitary_values['openid_configuration_endpoint'] : null;
+		if ( $stored_oidc_config_endpoint !== $new_oidc_config_endpoint ) {
 			delete_transient( 'aadsso_openid_configuration' );
 			AADSSO::debug_log('Setting \'openid_configuration_endpoint\' changed, cleared cached OpenID Connect values.');
 		}
@@ -678,6 +903,20 @@ class AADSSO_Settings_Page {
 			 . 'name="aadsso_settings[%1$s]" id="%1$s" value="%2$s" />',
 			$name, $value
 		);
+		if ( in_array( $name, $this->settings_from_env, true ) ) {
+			$env_map = array(
+				'client_id'     => 'AADSSO_CLIENT_ID',
+				'client_secret' => 'AADSSO_CLIENT_SECRET',
+				'redirect_uri'  => 'AADSSO_REDIRECT_URI',
+			);
+			if ( isset( $env_map[ $name ] ) ) {
+				printf(
+					'<p class="description" style="color:#b45309;">&#x26A0; %s <code>%s</code></p>',
+					esc_html__( 'This value is provided by the environment variable', 'aad-sso-wordpress' ),
+					esc_html( $env_map[ $name ] )
+				);
+			}
+		}
 	}
 
 	/**
@@ -711,5 +950,72 @@ class AADSSO_Settings_Page {
 		if ( $this->is_on_options_page() ) {
 			wp_enqueue_script( 'jquery' );
 		}
+	}
+
+	/**
+	 * Saves settings in Network Admin (Multisite).
+	 */
+	public function handle_network_settings_save() {
+		if ( ! is_multisite() ) {
+			wp_die( 'Not allowed.' );
+		}
+
+		if ( ! current_user_can( 'manage_network_options' ) ) {
+			wp_die( 'Permission denied.' );
+		}
+
+		check_admin_referer( 'aadsso_network_settings_save', 'aadsso_network_settings_nonce' );
+
+		$raw = isset( $_POST['aadsso_settings'] ) && is_array( $_POST['aadsso_settings'] )
+			? wp_unslash( $_POST['aadsso_settings'] )
+			: array();
+
+		// Bail out with an error if we received no form data.
+		if ( empty( $raw ) ) {
+			wp_die(
+				'<p><strong>Microsoft Entra ID SSO:</strong> No settings data received (empty POST). '
+				. 'Please try again or check your server\'s <code>post_max_size</code> and <code>max_input_vars</code> settings.</p>'
+				. '<a href="' . esc_url( network_admin_url( 'settings.php?page=aadsso_settings' ) ) . '">&larr; Back</a>'
+			);
+		}
+
+		$sanitized = $this->sanitize_settings( $raw );
+
+		// Write directly to wp_sitemeta, bypassing WordPress's option cache layer
+		// (which was causing duplicate rows via repeated INSERTs due to stale Redis cache).
+		global $wpdb;
+		$network_id = get_current_network_id();
+
+		// Delete ALL existing rows for this key (cleans up any duplicates).
+		$wpdb->delete(
+			$wpdb->sitemeta,
+			array( 'site_id' => $network_id, 'meta_key' => 'aadsso_settings' )
+		);
+
+		// Insert the fresh value.
+		$db_result = $wpdb->insert(
+			$wpdb->sitemeta,
+			array(
+				'site_id'    => $network_id,
+				'meta_key'   => 'aadsso_settings',
+				'meta_value' => maybe_serialize( $sanitized ),
+			)
+		);
+
+		// Also flush the object cache so subsequent get_site_option() calls in the
+		// same or next request return the new value instead of a cached false.
+		wp_cache_delete( $network_id . ':aadsso_settings', 'site-options' );
+		wp_cache_delete( $network_id . ':notoptions',      'site-options' );
+
+		if ( false === $db_result ) {
+			wp_die(
+				'<p><strong>Microsoft Entra ID SSO:</strong> Database write failed. '
+				. 'Error: <code>' . esc_html( $wpdb->last_error ) . '</code></p>'
+				. '<a href="' . esc_url( network_admin_url( 'settings.php?page=aadsso_settings' ) ) . '">&larr; Back</a>'
+			);
+		}
+
+		wp_redirect( network_admin_url( 'settings.php?page=aadsso_settings&updated=true' ) );
+		exit;
 	}
 }
